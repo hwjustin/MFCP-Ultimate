@@ -133,18 +133,31 @@ class CLOOMEConcatMLP(nn.Module):
         # Normalize CLOOME embeddings before projection
         self.cloome_bn = nn.BatchNorm1d(cloome_dim)
 
-        # Branch 1 & 2: concat projection layers
-        self.cloome_proj = nn.Linear(cloome_dim, embed_dim)
-        self.chem_proj = nn.Linear(chem_dim, embed_dim)
-
-        # Branch 3: CLIP projection layers (separate heads, outputs are L2-normalized)
-        self.clip_cloome_proj = nn.Linear(cloome_dim, embed_dim)
-        self.clip_chem_proj = nn.Linear(chem_dim, embed_dim)
-        # Fuse the two CLIP embeddings: concat(256, 256) = 512 → 256
-        self.clip_fusion = nn.Sequential(
-            nn.Linear(2 * embed_dim, embed_dim),
-            nn.ReLU(),
+        # Branch 1 & 2: concat projection layers (2-layer MLP, STiL-style)
+        self.cloome_proj = nn.Sequential(
+            nn.Linear(cloome_dim, cloome_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(cloome_dim, embed_dim),
         )
+        self.chem_proj = nn.Sequential(
+            nn.Linear(chem_dim, chem_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(chem_dim, embed_dim),
+        )
+
+        # Branch 3: CLIP projection layers (2-layer MLP, STiL-style)
+        self.clip_cloome_proj = nn.Sequential(
+            nn.Linear(cloome_dim, cloome_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(cloome_dim, embed_dim),
+        )
+        self.clip_chem_proj = nn.Sequential(
+            nn.Linear(chem_dim, chem_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(chem_dim, embed_dim),
+        )
+        # Fuse the two shared embeddings: concat(256, 256) = 512 → 256 (STiL-style reduce)
+        self.clip_fusion = nn.Linear(2 * embed_dim, embed_dim)
 
         # CLIP loss
         self.clip_loss_fn = SupervisedCLIPLoss(temperature=clip_temperature)
@@ -216,10 +229,8 @@ class CLOOMEConcatMLP(nn.Module):
         else:
             clip_loss = torch.tensor(0.0, device=images.device)
 
-        # Fuse CLIP branch: concat normalized embeddings → project to 256
-        clip_cloome_norm = F.normalize(clip_cloome, dim=1)
-        clip_chem_norm = F.normalize(clip_chem, dim=1)
-        h_clip = self.clip_fusion(torch.cat([clip_cloome_norm, clip_chem_norm], dim=-1))  # (B, 256)
+        # Fuse shared embeddings: concat → linear (STiL-style reduce, no normalization)
+        h_clip = self.clip_fusion(torch.cat([clip_cloome, clip_chem], dim=-1))  # (B, 256)
 
         # Concatenate all 3 branches: 256 × 3 = 768
         h_concat = torch.cat([h_cloome_proj, h_chem_proj, h_clip], dim=-1)  # (B, 768)
