@@ -13,8 +13,10 @@ CUDA_VISIBLE_DEVICES=0 python train_cloome_chembert_concat.py \
     --batch-size 64 \
     --grad-accum-steps 4 \
     --max-iter 50 \
-    --clip-loss-weight 0.1 \
+    --clip-loss-weight 0.5 \
     --clip-temperature 0.07 \
+    --club-loss-weight 0.1 \
+    --club-hidden-size 512 \
     --no-focal-loss --use-amp \
     --wandb-mode disabled
     # --wandb-project MFCP \

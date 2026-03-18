@@ -40,6 +40,42 @@ from encoder.cloome_encoder import CLOOMEEncoder
 from encoder.dataset import CellPaintingImageDataset
 
 
+class CLUBMean(nn.Module):
+    """CLUB with fixed unit variance (logvar=0). Estimates MI upper bound."""
+
+    def __init__(self, x_dim, y_dim, hidden_size=512):
+        super().__init__()
+        if hidden_size is None:
+            self.p_mu = nn.Linear(x_dim, y_dim)
+        else:
+            self.p_mu = nn.Sequential(
+                nn.Linear(x_dim, int(hidden_size)),
+                nn.ReLU(),
+                nn.Linear(int(hidden_size), y_dim),
+            )
+
+    def get_mu_logvar(self, x_samples):
+        mu = self.p_mu(x_samples)
+        return mu, 0
+
+    def forward(self, x_samples, y_samples):
+        mu, logvar = self.get_mu_logvar(x_samples)
+        positive = -(mu - y_samples) ** 2 / 2.0
+        prediction_1 = mu.unsqueeze(1)       # (N, 1, D)
+        y_samples_1 = y_samples.unsqueeze(0)  # (1, N, D)
+        negative = -((y_samples_1 - prediction_1) ** 2).mean(dim=1) / 2.0
+        positive = positive.sum(dim=-1)
+        negative = negative.sum(dim=-1)
+        return (positive - negative).mean()
+
+    def loglikeli(self, x_samples, y_samples):
+        mu, logvar = self.get_mu_logvar(x_samples)
+        return (-(mu - y_samples) ** 2).sum(dim=1).mean(dim=0)
+
+    def learning_loss(self, x_samples, y_samples):
+        return -self.loglikeli(x_samples, y_samples)
+
+
 def set_seed(seed: int) -> None:
     """Set random seed for reproducibility."""
     random.seed(seed)
@@ -118,6 +154,7 @@ class CLOOMEConcatMLP(nn.Module):
         num_tasks: int = 209,
         embed_dim: int = 256,
         clip_temperature: float = 0.07,
+        club_hidden_size: int = 512,
         cloome_config: str = "/data/huadi/cloome/src/training/model_configs/RN50.json",
         cloome_checkpoint: str | None = None,
     ):
@@ -161,6 +198,10 @@ class CLOOMEConcatMLP(nn.Module):
 
         # CLIP loss
         self.clip_loss_fn = SupervisedCLIPLoss(temperature=clip_temperature)
+
+        # CLUB mutual information estimators for disentanglement
+        self.club_cloome = CLUBMean(x_dim=embed_dim, y_dim=embed_dim, hidden_size=club_hidden_size)
+        self.club_chem = CLUBMean(x_dim=embed_dim, y_dim=embed_dim, hidden_size=club_hidden_size)
 
         # MLP classifier: 3 branches × 256 = 768 input
         width = 1024
@@ -229,6 +270,13 @@ class CLOOMEConcatMLP(nn.Module):
         else:
             clip_loss = torch.tensor(0.0, device=images.device)
 
+        # CLUB disentanglement: minimize MI between shared (CLIP) and specific (concat) features
+        club_cloome_mi = self.club_cloome(clip_cloome, h_cloome_proj)
+        club_cloome_est = self.club_cloome.learning_loss(clip_cloome, h_cloome_proj)
+        club_chem_mi = self.club_chem(clip_chem, h_chem_proj)
+        club_chem_est = self.club_chem.learning_loss(clip_chem, h_chem_proj)
+        club_loss = club_cloome_mi + club_cloome_est + club_chem_mi + club_chem_est
+
         # Fuse shared embeddings: concat → linear (STiL-style reduce, no normalization)
         h_clip = self.clip_fusion(torch.cat([clip_cloome, clip_chem], dim=-1))  # (B, 256)
 
@@ -237,7 +285,7 @@ class CLOOMEConcatMLP(nn.Module):
 
         logits = self.classifier(h_concat)  # (B, num_tasks)
 
-        return logits, clip_loss
+        return logits, clip_loss, club_loss
 
 
 def focal_loss(
@@ -269,11 +317,13 @@ def train_epoch(
     focal_alpha: float = 0.7,
     focal_gamma: float = 1.0,
     clip_loss_weight: float = 0.1,
-) -> tuple[float, float]:
-    """Train for one epoch. Returns (avg_task_loss, avg_clip_loss)."""
+    club_loss_weight: float = 0.1,
+) -> tuple[float, float, float]:
+    """Train for one epoch. Returns (avg_task_loss, avg_clip_loss, avg_club_loss)."""
     model.train()
     running_loss = 0.0
     running_clip_loss = 0.0
+    running_club_loss = 0.0
     n_batches = 0
 
     optimizer.zero_grad()
@@ -301,7 +351,7 @@ def train_epoch(
 
         if use_amp:
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                logits, clip_loss_val = model(images_b, x_chem_b, fov_mask_b, compound_labels_b)
+                logits, clip_loss_val, club_loss_val = model(images_b, x_chem_b, fov_mask_b, compound_labels_b)
                 if use_focal_loss:
                     per_elem_loss = focal_loss(logits, targets, alpha=focal_alpha, gamma=focal_gamma)
                 else:
@@ -309,7 +359,7 @@ def train_epoch(
                         logits, targets, reduction="none"
                     )
                 task_loss = (per_elem_loss * mask.float()).sum() / mask.float().sum()
-                loss = (task_loss + clip_loss_weight * clip_loss_val) / grad_accum_steps
+                loss = (task_loss + clip_loss_weight * clip_loss_val + club_loss_weight * club_loss_val) / grad_accum_steps
 
             scaler.scale(loss).backward()
 
@@ -318,7 +368,7 @@ def train_epoch(
                 scaler.update()
                 optimizer.zero_grad()
         else:
-            logits, clip_loss_val = model(images_b, x_chem_b, fov_mask_b, compound_labels_b)
+            logits, clip_loss_val, club_loss_val = model(images_b, x_chem_b, fov_mask_b, compound_labels_b)
             if use_focal_loss:
                 per_elem_loss = focal_loss(logits, targets, alpha=focal_alpha, gamma=focal_gamma)
             else:
@@ -326,7 +376,7 @@ def train_epoch(
                     logits, targets, reduction="none"
                 )
             task_loss = (per_elem_loss * mask.float()).sum() / mask.float().sum()
-            loss = (task_loss + clip_loss_weight * clip_loss_val) / grad_accum_steps
+            loss = (task_loss + clip_loss_weight * clip_loss_val + club_loss_weight * club_loss_val) / grad_accum_steps
 
             loss.backward()
 
@@ -336,17 +386,20 @@ def train_epoch(
 
         running_loss += task_loss.item()
         running_clip_loss += clip_loss_val.item()
+        running_club_loss += club_loss_val.item()
         n_batches += 1
 
         avg_loss = running_loss / max(n_batches, 1)
         avg_clip = running_clip_loss / max(n_batches, 1)
-        pbar.set_postfix({"task": f"{avg_loss:.4f}", "clip": f"{avg_clip:.4f}"})
+        avg_club = running_club_loss / max(n_batches, 1)
+        pbar.set_postfix({"task": f"{avg_loss:.4f}", "clip": f"{avg_clip:.4f}", "club": f"{avg_club:.4f}"})
 
         if use_wandb and (batch_idx + 1) % 50 == 0:
             try:
                 wandb.log({
                     "train/batch_task_loss": avg_loss,
                     "train/batch_clip_loss": avg_clip,
+                    "train/batch_club_loss": avg_club,
                     "train/batch": epoch * len(loader) + batch_idx,
                 })
             except:
@@ -363,7 +416,7 @@ def train_epoch(
             optimizer.step()
         optimizer.zero_grad()
 
-    return running_loss / max(n_batches, 1), running_clip_loss / max(n_batches, 1)
+    return running_loss / max(n_batches, 1), running_clip_loss / max(n_batches, 1), running_club_loss / max(n_batches, 1)
 
 
 def evaluate(
@@ -374,11 +427,12 @@ def evaluate(
     use_focal_loss: bool = True,
     focal_alpha: float = 0.7,
     focal_gamma: float = 1.0,
-) -> tuple[float, float, float]:
-    """Evaluate the model. Returns (avg_task_loss, accuracy, avg_clip_loss)."""
+) -> tuple[float, float, float, float]:
+    """Evaluate the model. Returns (avg_task_loss, accuracy, avg_clip_loss, avg_club_loss)."""
     model.eval()
     running_loss = 0.0
     running_clip_loss = 0.0
+    running_club_loss = 0.0
     n_batches = 0
     correct = 0.0
     total = 0.0
@@ -404,7 +458,7 @@ def evaluate(
 
             targets = (yb == 1).float()
 
-            logits, clip_loss_val = model(images_b, x_chem_b, fov_mask_b, compound_labels_b)
+            logits, clip_loss_val, club_loss_val = model(images_b, x_chem_b, fov_mask_b, compound_labels_b)
 
             if use_focal_loss:
                 per_elem_loss = focal_loss(logits, targets, alpha=focal_alpha, gamma=focal_gamma)
@@ -421,20 +475,23 @@ def evaluate(
 
             running_loss += loss.item()
             running_clip_loss += clip_loss_val.item()
+            running_club_loss += club_loss_val.item()
             n_batches += 1
 
             avg_loss = running_loss / max(n_batches, 1)
             avg_clip = running_clip_loss / max(n_batches, 1)
+            avg_club = running_club_loss / max(n_batches, 1)
             accuracy = correct / max(total, 1.0)
-            pbar.set_postfix({"loss": f"{avg_loss:.4f}", "clip": f"{avg_clip:.4f}", "acc": f"{accuracy:.4f}"})
+            pbar.set_postfix({"loss": f"{avg_loss:.4f}", "clip": f"{avg_clip:.4f}", "club": f"{avg_club:.4f}", "acc": f"{accuracy:.4f}"})
 
         pbar.close()
 
     avg_loss = running_loss / max(n_batches, 1)
     avg_clip = running_clip_loss / max(n_batches, 1)
+    avg_club = running_club_loss / max(n_batches, 1)
     accuracy = correct / max(total, 1.0)
 
-    return avg_loss, accuracy, avg_clip
+    return avg_loss, accuracy, avg_clip, avg_club
 
 
 def compute_metrics(
@@ -463,7 +520,7 @@ def compute_metrics(
             images_b = images_b.to(device)
             x_chem_b = x_chem_b.to(device)
 
-            logits, _ = model(images_b, x_chem_b, fov_mask_b)
+            logits, _, _ = model(images_b, x_chem_b, fov_mask_b)
 
             all_logits.append(logits.cpu().numpy())
             all_targets.append(yb.cpu().numpy())
@@ -589,6 +646,12 @@ def main() -> None:
     parser.add_argument("--clip-temperature", type=float, default=0.07,
                         help="Temperature for CLIP loss")
 
+    # CLUB disentanglement loss
+    parser.add_argument("--club-loss-weight", type=float, default=0.1,
+                        help="Weight for CLUB disentanglement loss")
+    parser.add_argument("--club-hidden-size", type=int, default=512,
+                        help="Hidden size for CLUB estimator networks")
+
     # WandB logging
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-run-name", type=str, default=None)
@@ -625,6 +688,8 @@ def main() -> None:
                 "chem_dropout_prob": args.chem_dropout_prob,
                 "clip_loss_weight": args.clip_loss_weight,
                 "clip_temperature": args.clip_temperature,
+                "club_loss_weight": args.club_loss_weight,
+                "club_hidden_size": args.club_hidden_size,
             },
         )
         print(f"WandB initialized: project={args.wandb_project}, run={wandb.run.name}")
@@ -787,6 +852,7 @@ def main() -> None:
         num_tasks=len(label_names),
         embed_dim=args.embed_dim,
         clip_temperature=args.clip_temperature,
+        club_hidden_size=args.club_hidden_size,
         cloome_config=args.cloome_config,
         cloome_checkpoint=args.cloome_checkpoint,
     ).to(device)
@@ -858,6 +924,7 @@ def main() -> None:
         print(f"  Feature dropout prob: {args.chem_dropout_prob}")
 
     print(f"\nCLIP loss weight: {args.clip_loss_weight}, temperature: {args.clip_temperature}")
+    print(f"CLUB loss weight: {args.club_loss_weight}, hidden size: {args.club_hidden_size}")
 
     for epoch in tqdm(range(1, args.max_iter + 1), desc="Training epochs"):
         # Handle backbone freeze/unfreeze and warmup
@@ -878,7 +945,7 @@ def main() -> None:
                 backbone_lr = args.backbone_lr
             optimizer.param_groups[0]["lr"] = backbone_lr
 
-        train_loss, train_clip_loss = train_epoch(
+        train_loss, train_clip_loss, train_club_loss = train_epoch(
             model,
             train_loader,
             optimizer,
@@ -892,8 +959,9 @@ def main() -> None:
             focal_alpha=args.focal_alpha,
             focal_gamma=args.focal_gamma,
             clip_loss_weight=args.clip_loss_weight,
+            club_loss_weight=args.club_loss_weight,
         )
-        val_loss, val_acc, val_clip_loss = evaluate(
+        val_loss, val_acc, val_clip_loss, val_club_loss = evaluate(
             model, val_loader, device, desc=f"Epoch {epoch} [Val]",
             use_focal_loss=args.use_focal_loss,
             focal_alpha=args.focal_alpha,
@@ -916,8 +984,8 @@ def main() -> None:
 
         print(
             f"Epoch {epoch:3d}/{args.max_iter} | "
-            f"train_loss={train_loss:.4f}, train_clip={train_clip_loss:.4f} | "
-            f"val_loss={val_loss:.4f}, val_clip={val_clip_loss:.4f}, val_acc={val_acc:.4f} | "
+            f"train_loss={train_loss:.4f}, train_clip={train_clip_loss:.4f}, train_club={train_club_loss:.4f} | "
+            f"val_loss={val_loss:.4f}, val_clip={val_clip_loss:.4f}, val_club={val_club_loss:.4f}, val_acc={val_acc:.4f} | "
             f"val_auroc={mean_auroc:.4f}, val_f1={mean_f1:.4f}, #auc>0.7={n_auc_gt_07}"
         )
 
@@ -927,8 +995,10 @@ def main() -> None:
                 "epoch": epoch,
                 "train/loss": train_loss,
                 "train/clip_loss": train_clip_loss,
+                "train/club_loss": train_club_loss,
                 "val/loss": val_loss,
                 "val/clip_loss": val_clip_loss,
+                "val/club_loss": val_club_loss,
                 "val/accuracy": val_acc,
                 "val/mean_roc_auc": mean_auroc,
                 "val/mean_ap": mean_ap,
@@ -1013,6 +1083,8 @@ def main() -> None:
         "aggregation_level": args.aggregation_level,
         "clip_loss_weight": args.clip_loss_weight,
         "clip_temperature": args.clip_temperature,
+        "club_loss_weight": args.club_loss_weight,
+        "club_hidden_size": args.club_hidden_size,
     }
     torch.save(checkpoint, args.output_model)
     print(f"\nSaved model checkpoint to {args.output_model}")
