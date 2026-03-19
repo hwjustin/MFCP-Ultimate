@@ -1,2 +1,4 @@
 wandb/
 __pycache__/
+results/
+tmp_splits/
