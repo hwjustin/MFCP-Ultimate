@@ -2,12 +2,14 @@
 Train CLOOME + ChemBERT Three-Branch Model (Concat + CLIP)
 
 Fine-tunes the CLOOME ResNet50 visual encoder while keeping ChemBERT features frozen.
-Three branches are concatenated for classification:
-  Branch 1 (CLOOME): 512 → 256-D
-  Branch 2 (ChemBERT): 768 → 256-D
-  Branch 3 (CLIP): CLOOME → 256-D + ChemBERT → 256-D (L2-normalized, contrastive loss),
-                    concat → 512 → 256-D
-Final: 256 × 3 = 768-D → MLP classifier (209 tasks)
+Three branches produce disentangled features:
+  Branch 1 (cell-specific):  CLOOME 512 → 256-D
+  Branch 2 (chem-specific):  ChemBERT 768 → 256-D
+  Branch 3 (shared/CLIP):    CLOOME → 256-D + ChemBERT → 256-D → fused 256-D
+
+A Task-Query Transformer Decoder uses 209 learnable task embeddings that
+cross-attend to the 3 feature tokens (cell_specific, shared, chem_specific),
+enabling each bioassay task to learn its own adaptive attention pattern.
 
 The CLIP branch uses SupervisedCLIPLoss to handle replicates (multiple wells per compound).
 
@@ -145,6 +147,82 @@ def create_compound_level_split(split_csv: str) -> str:
     return temp_csv
 
 
+class TaskTransformerDecoderLayer(nn.Module):
+    """Single decoder layer: self-attn among task tokens, cross-attn to features, FFN."""
+
+    def __init__(self, dim: int, num_heads: int = 8, mlp_ratio: float = 4.0, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.self_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+
+        self.norm2 = nn.LayerNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+
+        self.norm3 = nn.LayerNorm(dim)
+        mlp_hidden = int(dim * mlp_ratio)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, mlp_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, task_tokens: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+        x = self.norm1(task_tokens)
+        task_tokens = task_tokens + self.self_attn(x, x, x)[0]
+
+        x = self.norm2(task_tokens)
+        task_tokens = task_tokens + self.cross_attn(x, features, features)[0]
+
+        task_tokens = task_tokens + self.ffn(self.norm3(task_tokens))
+        return task_tokens
+
+
+class TaskTransformerDecoder(nn.Module):
+    """Query2Label-style decoder: learnable task queries cross-attend to feature tokens."""
+
+    def __init__(
+        self,
+        num_tasks: int = 209,
+        feature_dim: int = 256,
+        transformer_dim: int = 256,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.task_queries = nn.Parameter(torch.randn(num_tasks, transformer_dim) * 0.02)
+
+        self.feature_proj = nn.Linear(feature_dim, transformer_dim) if feature_dim != transformer_dim else nn.Identity()
+
+        self.layers = nn.ModuleList([
+            TaskTransformerDecoderLayer(transformer_dim, num_heads, mlp_ratio, dropout)
+            for _ in range(num_layers)
+        ])
+        self.final_norm = nn.LayerNorm(transformer_dim)
+        self.output_proj = nn.Linear(transformer_dim, 1)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            features: (B, 3, feature_dim) stacked [cell_specific, shared, chem_specific]
+        Returns:
+            logits: (B, num_tasks)
+        """
+        B = features.shape[0]
+        features = self.feature_proj(features)
+        task_tokens = self.task_queries.unsqueeze(0).expand(B, -1, -1)
+
+        for layer in self.layers:
+            task_tokens = layer(task_tokens, features)
+
+        task_tokens = self.final_norm(task_tokens)
+        logits = self.output_proj(task_tokens).squeeze(-1)  # (B, num_tasks)
+        return logits
+
+
 class CLOOMEConcatMLP(nn.Module):
     """CLOOME + ChemBERT three-branch model (concat + CLIP)."""
 
@@ -157,6 +235,11 @@ class CLOOMEConcatMLP(nn.Module):
         club_hidden_size: int = 512,
         cloome_config: str = "/data/huadi/cloome/src/training/model_configs/RN50.json",
         cloome_checkpoint: str | None = None,
+        transformer_dim: int = 256,
+        transformer_heads: int = 8,
+        transformer_layers: int = 2,
+        transformer_mlp_ratio: float = 4.0,
+        transformer_dropout: float = 0.1,
     ):
         super().__init__()
 
@@ -203,22 +286,15 @@ class CLOOMEConcatMLP(nn.Module):
         self.club_cloome = CLUBMean(x_dim=embed_dim, y_dim=embed_dim, hidden_size=club_hidden_size)
         self.club_chem = CLUBMean(x_dim=embed_dim, y_dim=embed_dim, hidden_size=club_hidden_size)
 
-        # MLP classifier: 3 branches × 256 = 768 input
-        width = 1024
-        self.classifier = nn.Sequential(
-            nn.Linear(3 * embed_dim, width),
-            nn.BatchNorm1d(width),
-            nn.ReLU(),
-            nn.Dropout(p=0.5),
-            nn.Linear(width, width),
-            nn.BatchNorm1d(width),
-            nn.ReLU(),
-            nn.Dropout(p=0.5),
-            nn.Linear(width, width),
-            nn.BatchNorm1d(width),
-            nn.ReLU(),
-            nn.Dropout(p=0.5),
-            nn.Linear(width, num_tasks),
+        # Task-Query Transformer Decoder: 209 learnable task queries cross-attend to 3 feature tokens
+        self.classifier = TaskTransformerDecoder(
+            num_tasks=num_tasks,
+            feature_dim=embed_dim,
+            transformer_dim=transformer_dim,
+            num_heads=transformer_heads,
+            num_layers=transformer_layers,
+            mlp_ratio=transformer_mlp_ratio,
+            dropout=transformer_dropout,
         )
 
     def _encode_cloome(self, images, fov_mask):
@@ -280,10 +356,10 @@ class CLOOMEConcatMLP(nn.Module):
         # Fuse shared embeddings: concat → linear (STiL-style reduce, no normalization)
         h_clip = self.clip_fusion(torch.cat([clip_cloome, clip_chem], dim=-1))  # (B, 256)
 
-        # Concatenate all 3 branches: 256 × 3 = 768
-        h_concat = torch.cat([h_cloome_proj, h_chem_proj, h_clip], dim=-1)  # (B, 768)
+        # Stack 3 feature tokens: [cell_specific, shared, chem_specific]
+        features = torch.stack([h_cloome_proj, h_clip, h_chem_proj], dim=1)  # (B, 3, embed_dim)
 
-        logits = self.classifier(h_concat)  # (B, num_tasks)
+        logits = self.classifier(features)  # (B, num_tasks)
 
         return logits, clip_loss, club_loss
 
@@ -652,6 +728,18 @@ def main() -> None:
     parser.add_argument("--club-hidden-size", type=int, default=512,
                         help="Hidden size for CLUB estimator networks")
 
+    # Task-Query Transformer Decoder
+    parser.add_argument("--transformer-dim", type=int, default=256,
+                        help="Hidden dim for task-query transformer (default: matches embed-dim)")
+    parser.add_argument("--transformer-heads", type=int, default=8,
+                        help="Number of attention heads in transformer decoder")
+    parser.add_argument("--transformer-layers", type=int, default=2,
+                        help="Number of transformer decoder layers")
+    parser.add_argument("--transformer-mlp-ratio", type=float, default=4.0,
+                        help="FFN expansion ratio in transformer")
+    parser.add_argument("--transformer-dropout", type=float, default=0.1,
+                        help="Dropout rate in transformer attention and FFN")
+
     # WandB logging
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-run-name", type=str, default=None)
@@ -690,6 +778,11 @@ def main() -> None:
                 "clip_temperature": args.clip_temperature,
                 "club_loss_weight": args.club_loss_weight,
                 "club_hidden_size": args.club_hidden_size,
+                "transformer_dim": args.transformer_dim,
+                "transformer_heads": args.transformer_heads,
+                "transformer_layers": args.transformer_layers,
+                "transformer_mlp_ratio": args.transformer_mlp_ratio,
+                "transformer_dropout": args.transformer_dropout,
             },
         )
         print(f"WandB initialized: project={args.wandb_project}, run={wandb.run.name}")
@@ -855,6 +948,11 @@ def main() -> None:
         club_hidden_size=args.club_hidden_size,
         cloome_config=args.cloome_config,
         cloome_checkpoint=args.cloome_checkpoint,
+        transformer_dim=args.transformer_dim,
+        transformer_heads=args.transformer_heads,
+        transformer_layers=args.transformer_layers,
+        transformer_mlp_ratio=args.transformer_mlp_ratio,
+        transformer_dropout=args.transformer_dropout,
     ).to(device)
 
     # Print model statistics
@@ -925,6 +1023,9 @@ def main() -> None:
 
     print(f"\nCLIP loss weight: {args.clip_loss_weight}, temperature: {args.clip_temperature}")
     print(f"CLUB loss weight: {args.club_loss_weight}, hidden size: {args.club_hidden_size}")
+    print(f"\nTask-Query Transformer: dim={args.transformer_dim}, heads={args.transformer_heads}, "
+          f"layers={args.transformer_layers}, mlp_ratio={args.transformer_mlp_ratio}, "
+          f"dropout={args.transformer_dropout}")
 
     for epoch in tqdm(range(1, args.max_iter + 1), desc="Training epochs"):
         # Handle backbone freeze/unfreeze and warmup
@@ -1085,6 +1186,11 @@ def main() -> None:
         "clip_temperature": args.clip_temperature,
         "club_loss_weight": args.club_loss_weight,
         "club_hidden_size": args.club_hidden_size,
+        "transformer_dim": args.transformer_dim,
+        "transformer_heads": args.transformer_heads,
+        "transformer_layers": args.transformer_layers,
+        "transformer_mlp_ratio": args.transformer_mlp_ratio,
+        "transformer_dropout": args.transformer_dropout,
     }
     torch.save(checkpoint, args.output_model)
     print(f"\nSaved model checkpoint to {args.output_model}")

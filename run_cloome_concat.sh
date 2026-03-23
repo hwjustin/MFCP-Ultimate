@@ -1,5 +1,5 @@
 #!/bin/bash
-CUDA_VISIBLE_DEVICES=0 python train_cloome_chembert_concat.py \
+CUDA_VISIBLE_DEVICES=2 python train_cloome_chembert_concat.py \
     --train-split /data/huadi/cellpainting_data/cpg0012/splits/datasplit1-train.csv \
     --val-split /data/huadi/cellpainting_data/cpg0012/splits/datasplit1-val.csv \
     --test-split /data/huadi/cellpainting_data/cpg0012/splits/datasplit1-test.csv \
@@ -17,7 +17,12 @@ CUDA_VISIBLE_DEVICES=0 python train_cloome_chembert_concat.py \
     --clip-temperature 0.07 \
     --club-loss-weight 0.1 \
     --club-hidden-size 512 \
+    --transformer-dim 256 \
+    --transformer-heads 8 \
+    --transformer-layers 2 \
+    --transformer-mlp-ratio 4.0 \
+    --transformer-dropout 0.1 \
     --no-focal-loss --use-amp \
     --wandb-mode disabled
     # --wandb-project MFCP \
-    # --wandb-run-name cloome-3branch-clip
+    # --wandb-run-name cloome-3branch-transformer
