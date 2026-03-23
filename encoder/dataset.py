@@ -479,3 +479,115 @@ class CellPaintingImageDataset(Dataset):
             x_chem = self._augment_chem(x_chem)
 
         return stacked_image, x_chem, y, compound_label
+
+
+# Max FOVs per compound for aggregation (wells * sites). Lower = less GPU memory.
+# ~4 wells * 6 sites = 24; use 24 to balance coverage vs memory.
+MAX_FOVS_PER_COMPOUND = 24
+
+
+class CellPaintingCompoundAggregatedDataset(Dataset):
+    """Compound-level dataset that aggregates all wells per compound.
+
+    Each sample is one compound. Images = all FOVs from all wells of that compound,
+    concatenated. Returns (images, fov_mask, x_chem, y, compound_label) with images
+    padded to MAX_FOVS_PER_COMPOUND. Use with collate that expects variable-length
+    per compound (this dataset already pads internally for consistent __getitem__).
+    """
+
+    def __init__(
+        self,
+        split_csv: str,
+        chembert_dict: dict,
+        label_dict: dict,
+        image_root: str = "/data/huadi/cpg0012-wawer/images",
+        max_sites: int = 6,
+        image_size: int | None = None,
+        max_fovs_per_compound: int = MAX_FOVS_PER_COMPOUND,
+        augment_chem: bool = False,
+        chem_noise_std: float = 0.1,
+        chem_dropout_prob: float = 0.0,
+    ):
+        self.image_root = image_root
+        self.max_sites = max_sites
+        self.image_size = image_size
+        self.max_fovs_per_compound = max_fovs_per_compound
+        self.augment_chem = augment_chem
+        self.chem_noise_std = chem_noise_std
+        self.chem_dropout_prob = chem_dropout_prob
+
+        # Build well-level dataset to reuse loading logic
+        self._well_ds = CellPaintingImageDataset(
+            split_csv=split_csv,
+            chembert_dict=chembert_dict,
+            label_dict=label_dict,
+            image_root=image_root,
+            cloome_multi_fov=True,
+            max_sites=max_sites,
+            image_size=image_size,
+            augment_chem=False,
+        )
+
+        # Group well indices by compound (INCHIKEY)
+        ik_to_well_indices = {}
+        for well_idx, group in enumerate(self._well_ds.well_groups):
+            ik = str(group.iloc[0]["INCHIKEY"])
+            if ik not in ik_to_well_indices:
+                ik_to_well_indices[ik] = []
+            ik_to_well_indices[ik].append(well_idx)
+
+        self.compound_order = sorted(ik_to_well_indices.keys())
+        self.ik_to_well_indices = ik_to_well_indices
+        self.chembert_dict = chembert_dict
+        self.label_dict = label_dict
+        self.ik_to_label = self._well_ds.ik_to_label
+
+        print(
+            f"CellPaintingCompoundAggregatedDataset: {len(self.compound_order)} compounds "
+            f"(aggregating all wells per compound)"
+        )
+
+    def __len__(self) -> int:
+        return len(self.compound_order)
+
+    def __getitem__(self, idx: int):
+        inchikey = self.compound_order[idx]
+        well_indices = self.ik_to_well_indices[inchikey]
+
+        all_images = []
+        all_masks = []
+        for wi in well_indices:
+            images, fov_mask, x_chem, y, compound_label = self._well_ds._getitem_cloome_multi_fov(wi)
+            n = images.shape[0]
+            for i in range(n):
+                if fov_mask[i].item():
+                    all_images.append(images[i])
+                    all_masks.append(True)
+
+        if len(all_images) == 0:
+            # Fallback: use first well if something went wrong
+            images, fov_mask, x_chem, y, compound_label = self._well_ds._getitem_cloome_multi_fov(well_indices[0])
+            all_images = [images[i] for i in range(images.shape[0]) if fov_mask[i].item()]
+            all_masks = [True] * len(all_images)
+
+        n_valid = len(all_images)
+        if n_valid > self.max_fovs_per_compound:
+            all_images = all_images[: self.max_fovs_per_compound]
+            all_masks = [True] * self.max_fovs_per_compound
+            n_valid = self.max_fovs_per_compound
+
+        C, H, W = all_images[0].shape
+        images_tensor = torch.zeros((self.max_fovs_per_compound, C, H, W), dtype=torch.float32)
+        fov_mask_tensor = torch.zeros(self.max_fovs_per_compound, dtype=torch.bool)
+        for i, img in enumerate(all_images):
+            images_tensor[i] = img
+            fov_mask_tensor[i] = all_masks[i]
+
+        x_chem = torch.from_numpy(self.chembert_dict[inchikey].astype(np.float32))
+        y = torch.from_numpy(self.label_dict[inchikey].astype(np.float32))
+        compound_label = torch.tensor(self.ik_to_label[inchikey], dtype=torch.long)
+
+        if self.augment_chem:
+            x_chem = self._well_ds._augment_chem(x_chem)
+
+        return images_tensor, fov_mask_tensor, x_chem, y, compound_label

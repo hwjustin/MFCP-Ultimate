@@ -49,7 +49,7 @@ except ImportError:
 
 from clip_loss import CLIPLoss
 from encoder.cloome_encoder import CLOOMEEncoder
-from encoder.dataset import CellPaintingImageDataset
+from encoder.dataset import CellPaintingImageDataset, CellPaintingCompoundAggregatedDataset
 
 
 def set_seed(seed: int) -> None:
@@ -155,11 +155,20 @@ class CLOOMEChemContrastive(nn.Module):
         self.clip_loss_fn = CLIPLoss(temperature=clip_temperature)
 
     def _encode_cloome(self, images: torch.Tensor, fov_mask: torch.Tensor | None) -> torch.Tensor:
-        """Shared CLOOME encoding -> (B, 512)."""
+        """Shared CLOOME encoding -> (B, 512). Uses chunked forward when many FOVs to avoid OOM."""
         if fov_mask is not None:
             bsz, sites, channels, height, width = images.shape
             flat_images = images.reshape(bsz * sites, channels, height, width)
-            flat_embeds = self.cloome_encoder(flat_images)
+            n_flat = flat_images.shape[0]
+            chunk_size = 24  # Encode in chunks to avoid OOM when GPU memory is limited
+            if n_flat <= chunk_size:
+                flat_embeds = self.cloome_encoder(flat_images)
+            else:
+                flat_embeds = []
+                for i in range(0, n_flat, chunk_size):
+                    chunk = flat_images[i : i + chunk_size]
+                    flat_embeds.append(self.cloome_encoder(chunk))
+                flat_embeds = torch.cat(flat_embeds, dim=0)
             per_fov = flat_embeds.reshape(bsz, sites, -1)
             mask_expanded = fov_mask.unsqueeze(-1).float()
             h_cloome = (per_fov * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
@@ -470,7 +479,7 @@ def main() -> None:
     parser.add_argument(
         "--aggregation-level",
         type=str,
-        choices=["well", "compound"],
+        choices=["well", "compound", "compound_aggregated"],
         default="well",
     )
 
@@ -583,7 +592,8 @@ def main() -> None:
     test_split = args.test_split
     temp_files = []
     if args.aggregation_level == "compound":
-        print("\n=== Creating Compound-Level Splits ===")
+        if is_main_process():
+            print("\n=== Creating Compound-Level Splits (one well per compound) ===")
         train_split = create_compound_level_split(args.train_split)
         val_split = create_compound_level_split(args.val_split)
         temp_files.extend([train_split, val_split])
@@ -591,37 +601,50 @@ def main() -> None:
             test_split = create_compound_level_split(args.test_split)
             temp_files.append(test_split)
 
+    use_compound_aggregated = args.aggregation_level == "compound_aggregated"
     if is_main_process():
-        print(f"\n=== Creating Datasets (cloome_multi_fov=True, aggregation_level={args.aggregation_level}) ===")
+        print(f"\n=== Creating Datasets (aggregation_level={args.aggregation_level}) ===")
         print("\nTrain split:")
-    train_ds = CellPaintingImageDataset(
-        split_csv=train_split,
-        chembert_dict=chembert_dict,
-        label_dict=label_dict,
-        image_root=args.image_root,
-        cloome_multi_fov=True,
-        image_size=args.image_size,
-        augment_chem=args.augment_chem,
-        chem_noise_std=args.chem_noise_std,
-        chem_dropout_prob=args.chem_dropout_prob,
-    )
+
+    if use_compound_aggregated:
+        train_ds = CellPaintingCompoundAggregatedDataset(
+            split_csv=train_split,
+            chembert_dict=chembert_dict,
+            label_dict=label_dict,
+            image_root=args.image_root,
+            max_sites=6,
+            image_size=args.image_size,
+            augment_chem=args.augment_chem,
+            chem_noise_std=args.chem_noise_std,
+            chem_dropout_prob=args.chem_dropout_prob,
+        )
+    else:
+        train_ds = CellPaintingImageDataset(
+            split_csv=train_split,
+            chembert_dict=chembert_dict,
+            label_dict=label_dict,
+            image_root=args.image_root,
+            cloome_multi_fov=True,
+            image_size=args.image_size,
+            augment_chem=args.augment_chem,
+            chem_noise_std=args.chem_noise_std,
+            chem_dropout_prob=args.chem_dropout_prob,
+        )
     if is_main_process():
         print("\nVal split:")
-    val_ds = CellPaintingImageDataset(
-        split_csv=val_split,
-        chembert_dict=chembert_dict,
-        label_dict=label_dict,
-        image_root=args.image_root,
-        cloome_multi_fov=True,
-        image_size=args.image_size,
-        augment_chem=False,
-    )
-    test_ds = None
-    if test_split:
-        if is_main_process():
-            print("\nTest split:")
-        test_ds = CellPaintingImageDataset(
-            split_csv=test_split,
+    if use_compound_aggregated:
+        val_ds = CellPaintingCompoundAggregatedDataset(
+            split_csv=val_split,
+            chembert_dict=chembert_dict,
+            label_dict=label_dict,
+            image_root=args.image_root,
+            max_sites=6,
+            image_size=args.image_size,
+            augment_chem=False,
+        )
+    else:
+        val_ds = CellPaintingImageDataset(
+            split_csv=val_split,
             chembert_dict=chembert_dict,
             label_dict=label_dict,
             image_root=args.image_root,
@@ -629,10 +652,37 @@ def main() -> None:
             image_size=args.image_size,
             augment_chem=False,
         )
+    test_ds = None
+    if test_split:
+        if is_main_process():
+            print("\nTest split:")
+        if use_compound_aggregated:
+            test_ds = CellPaintingCompoundAggregatedDataset(
+                split_csv=test_split,
+                chembert_dict=chembert_dict,
+                label_dict=label_dict,
+                image_root=args.image_root,
+                max_sites=6,
+                image_size=args.image_size,
+                augment_chem=False,
+            )
+        else:
+            test_ds = CellPaintingImageDataset(
+                split_csv=test_split,
+                chembert_dict=chembert_dict,
+                label_dict=label_dict,
+                image_root=args.image_root,
+                cloome_multi_fov=True,
+                image_size=args.image_size,
+                augment_chem=False,
+            )
 
     if is_main_process():
         print("\n=== Computing ChemBERT Normalization Statistics ===")
-    train_inchikeys = list(set(str(g.iloc[0]["INCHIKEY"]) for g in train_ds.well_groups))
+    if use_compound_aggregated:
+        train_inchikeys = list(train_ds.compound_order)
+    else:
+        train_inchikeys = list(set(str(g.iloc[0]["INCHIKEY"]) for g in train_ds.well_groups))
     all_chem_features = [chembert_dict[str(ik)] for ik in train_inchikeys if str(ik) in chembert_dict]
     x_chem_train = np.stack(all_chem_features, axis=0)
     x_chem_train = np.clip(x_chem_train, -1e3, 1e3)
